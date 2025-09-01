@@ -1,16 +1,20 @@
 import requests
 import pandas as pd
 
-PLAYER_ID = "1137705"  # Enzo Fernandez
+PLAYER_ID = "1137705"
 API_URL = f"https://www.fotmob.com/api/playerData?id={PLAYER_ID}"
 
 def main():
     print("Fetching Enzo Fernandez FotMob match data (API method)...")
-    resp = requests.get(API_URL)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Referer": "https://www.fotmob.com/",
+        "Accept": "application/json",
+    }
+    resp = requests.get(API_URL, headers=headers)
     resp.raise_for_status()
     data = resp.json()
     matches = []
-    # Try to extract all seasons and matches
     for season in data.get("seasons", []):
         for match in season.get("matches", []):
             motm = match.get("isPlayerOfTheMatch", False)
