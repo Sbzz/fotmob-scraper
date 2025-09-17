@@ -1,0 +1,897 @@
+Python (Playwright)
+
+
+How to use
+1. Install
+pip install playwright python-dateutil
+python -m playwright install chromium
+
+2. Put your players in a file (one URL per line), e.g. players.txt:
+https://www.fotmob.com/players/1467236/lamine-yamal
+https://www.fotmob.com/players/1021382/joao-pedro
+
+3. Run
+python fotmob_batch_pom_2025_26.py \
+  --players-file players.txt \
+  --max-matches-per-player 100 \
+  --out-json out.json \
+  --out-csv out.csv
+
+Tips:
+
+Use --urls (instead of --players-file) to pass URLs inline.
+--delay controls a polite pause between pages (default 1.5s).
+
+Install
+pip install playwright python-dateutil
+python -m playwright install chromium
+
+
+Script: fotmob_batch_pom_2025_26.py
+
+
+import asyncio
+import argparse
+import csv
+import json
+import os
+import re
+import unicodedata
+from datetime import datetime, timezone
+from typing import List, Dict, Any, Optional
+
+from dateutil import parser as dateparser
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+
+ALLOWED_LEAGUES = {
+    "premier league",
+    "bundesliga",
+    "laliga",     # fotmob often uses "LaLiga"
+    "la liga",    # just in case
+    "serie a",
+    "ligue 1",
+}
+
+# Season window for 2025–2026 (Europe)
+SEASON_START = datetime(2025, 7, 1, tzinfo=timezone.utc)
+SEASON_END   = datetime(2026, 6, 30, 23, 59, 59, tzinfo=timezone.utc)
+
+POM_PATTERNS = [
+    re.compile(r"\bplayer of the match\b", re.I),
+    # (Backup for locale variance; expand if you encounter alternates)
+    re.compile(r"\bman of the match\b", re.I),
+]
+
+def norm(s: str) -> str:
+    if s is None:
+        return ""
+    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c)).casefold()
+
+def league_is_allowed(label: str) -> bool:
+    n = norm(label)
+    for allowed in ALLOWED_LEAGUES:
+        if allowed in n:
+            return True
+    return False
+
+async def maybe_click_cookies(page):
+    # Try a few consent buttons if they appear
+    for pat in [r"Accept.*", r"Agree.*", r"Allow all.*", r"Got it.*", r"I understand.*", r"Continue.*"]:
+        try:
+            btn = page.get_by_role("button", name=re.compile(pat, re.I))
+            if await btn.count() > 0:
+                await btn.first.click(timeout=1500)
+                break
+        except Exception:
+            pass
+
+async def extract_player_name(page) -> str:
+    try:
+        h1 = page.get_by_role("heading", level=1)
+        if await h1.count() > 0:
+            txt = (await h1.first.text_content()) or ""
+            txt = txt.strip()
+            if txt:
+                return txt
+    except Exception:
+        pass
+    try:
+        title = (await page.title()) or ""
+        return title.split(" - ")[0].strip() or title.strip()
+    except Exception:
+        return ""
+
+async def collect_match_links_with_scroll(page, max_links: int, max_scrolls: int = 10) -> List[str]:
+    """
+    Collect unique match links from the player page, scrolling a bit to load more.
+    """
+    seen = set()
+    for _ in range(max_scrolls):
+        links = await page.locator('a[href*="/match/"]').evaluate_all("els => els.map(e => e.href)")
+        for href in links:
+            if href not in seen:
+                seen.add(href)
+                if len(seen) >= max_links:
+                    return list(seen)[:max_links]
+        # Scroll to bottom; give the page a moment to load lazy content
+        try:
+            await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+        except Exception:
+            pass
+        await asyncio.sleep(0.8)
+    return list(seen)[:max_links]
+
+async def parse_match_competition(page) -> Optional[str]:
+    """
+    Try to find the competition/league label on the match page.
+    """
+    # 1) Common: a link to the league/tournament page
+    try:
+        texts = await page.locator('a[href*="/league"], a[href*="/leagues"], a[href*="/tournament"], a[href*="/table"]').all_text_contents()
+        for t in texts:
+            if league_is_allowed(t):
+                return t.strip()
+    except Exception:
+        pass
+    # 2) Fallback: scan body text and look for an allowed league name
+    try:
+        body = await page.evaluate("() => document.body.innerText || ''")
+        for lbl in ALLOWED_LEAGUES:
+            if lbl in norm(body):
+                return lbl
+    except Exception:
+        pass
+    return None
+
+async def parse_match_datetime(page) -> Optional[datetime]:
+    """
+    Extract match datetime. Prefer <time datetime="...">, else parse visible text.
+    Return timezone-aware UTC datetime if possible; otherwise naive parsed as UTC.
+    """
+    # Try <time datetime="...">
+    try:
+        times = page.locator("time")
+        cnt = await times.count()
+        for i in range(cnt):
+            dt_attr = await times.nth(i).get_attribute("datetime")
+            if dt_attr:
+                try:
+                    dt = dateparser.parse(dt_attr)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    else:
+                        dt = dt.astimezone(timezone.utc)
+                    return dt
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Fallback: parse the title or body text
+    candidates = []
+    try:
+        t = await page.title()
+        if t:
+            candidates.append(t)
+    except Exception:
+        pass
+    try:
+        body = await page.evaluate("() => document.body.innerText || ''")
+        if body:
+            candidates.append(body)
+    except Exception:
+        pass
+
+    for txt in candidates:
+        # Try a few formats; dateutil is flexible
+        try:
+            dt = dateparser.parse(txt, fuzzy=True, dayfirst=False)
+            if dt:
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                else:
+                    dt = dt.astimezone(timezone.utc)
+                return dt
+        except Exception:
+            continue
+    return None
+
+async def find_pom_block_and_check_player(page, player_name: str) -> (bool, Optional[float], bool):
+    """
+    Returns (found_pom_block, rating, player_is_pom)
+    """
+    found = False
+    rating = None
+    player_is_pom = False
+
+    # Locate a "Player of the Match" / "Man of the Match" label
+    label_locator = None
+    for rx in POM_PATTERNS:
+        try:
+            loc = page.locator(f"text=/{rx.pattern.strip('/')}/i")
+            if await loc.count() > 0:
+                label_locator = loc
+                break
+        except Exception:
+            continue
+
+    if label_locator:
+        found = True
+        # Get surrounding text
+        container_text = ""
+        try:
+            container_text = await label_locator.first.evaluate(
+                """el => {
+                    const host = el.closest("section,article,div") || el;
+                    return host.innerText || "";
+                }"""
+            )
+        except Exception:
+            try:
+                container_text = await page.evaluate("() => document.body.innerText || ''")
+            except Exception:
+                container_text = ""
+
+        if norm(player_name) in norm(container_text):
+            player_is_pom = True
+
+        m = re.search(r"\b(\d{1,2}(?:\.\d)?)\b", container_text)
+        if m:
+            try:
+                rating = float(m.group(1))
+            except Exception:
+                pass
+
+    return found, rating, player_is_pom
+
+async def process_match(context, match_url: str, player_name: str, polite_delay: float) -> Dict[str, Any]:
+    page = await context.new_page()
+    out = {
+        "match_url": match_url,
+        "match_title": None,
+        "league_label": None,
+        "match_datetime_utc": None,
+        "within_season_2025_26": False,
+        "league_allowed": False,
+        "player_of_the_match_block_found": False,
+        "player_is_pom": False,
+        "rating": None,
+        "error": None,
+    }
+    try:
+        await page.goto(match_url, wait_until="domcontentloaded", timeout=60000)
+        await maybe_click_cookies(page)
+        out["match_title"] = await page.title()
+
+        league = await parse_match_competition(page)
+        out["league_label"] = league
+        out["league_allowed"] = bool(league and league_is_allowed(league))
+
+        mdt = await parse_match_datetime(page)
+        if mdt:
+            out["match_datetime_utc"] = mdt.isoformat()
+            out["within_season_2025_26"] = SEASON_START <= mdt <= SEASON_END
+
+        found, rating, is_pom = await find_pom_block_and_check_player(page, player_name)
+        out["player_of_the_match_block_found"] = found
+        out["player_is_pom"] = is_pom
+        out["rating"] = rating
+
+        await asyncio.sleep(polite_delay)
+    except Exception as e:
+        out["error"] = str(e)
+    finally:
+        await page.close()
+    return out
+
+async def process_player(context, player_url: str, max_links: int, delay: float) -> Dict[str, Any]:
+    page = await context.new_page()
+    player_name = "Unknown"
+    results: List[Dict[str, Any]] = []
+    try:
+        await page.goto(player_url, wait_until="domcontentloaded", timeout=60000)
+        await maybe_click_cookies(page)
+        player_name = await extract_player_name(page) or "Unknown"
+
+        match_links = await collect_match_links_with_scroll(page, max_links=max_links, max_scrolls=12)
+        # Process matches sequentially (gentle)
+        for href in match_links:
+            info = await process_match(context, href, player_name, delay)
+            results.append(info)
+    finally:
+        await page.close()
+
+    # Filter strictly: allowed league + season window + POM true
+    filtered = [
+        r for r in results
+        if r.get("league_allowed") and r.get("within_season_2025_26") and r.get("player_is_pom")
+    ]
+
+    return {
+        "player_url": player_url,
+        "player_name": player_name,
+        "checked_matches": len(results),
+        "pom_2025_26_domestic_count": len(filtered),
+        "pom_2025_26_domestic": filtered,
+        "raw": results,
+    }
+
+def load_player_urls(args) -> List[str]:
+    urls = []
+    if args.players_file:
+        with open(args.players_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    urls.append(line)
+    if args.urls:
+        for u in args.urls:
+            urls.append(u.strip())
+    # De-dupe
+    seen = set()
+    out = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+async def main():
+    ap = argparse.ArgumentParser(description="Batch-check FotMob Player of the Match for Top 5 leagues (2025–26 only).")
+    ap.add_argument("--players-file", help="Text file with one FotMob player URL per line.")
+    ap.add_argument("--urls", nargs="*", help="One or more player URLs passed inline.")
+    ap.add_argument("--max-matches-per-player", type=int, default=80, help="Max match links to scan per player (default 80).")
+    ap.add_argument("--delay", type=float, default=1.5, help="Polite delay between match pages (seconds).")
+    ap.add_argument("--out-json", default="pom_results_2025_26.json", help="Output JSON file.")
+    ap.add_argument("--out-csv", default="pom_results_2025_26.csv", help="Output CSV file (per POM hit).")
+    args = ap.parse_args()
+
+    player_urls = load_player_urls(args)
+    if not player_urls:
+        raise SystemExit("No player URLs provided. Use --players-file or --urls.")
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context()
+
+        all_results = []
+        for url in player_urls:
+            print(f"Processing: {url}")
+            try:
+                res = await process_player(context, url, args.max_matches_per_player, args.delay)
+                all_results.append(res)
+            except Exception as e:
+                all_results.append({
+                    "player_url": url,
+                    "player_name": "Unknown",
+                    "checked_matches": 0,
+                    "pom_2025_26_domestic_count": 0,
+                    "pom_2025_26_domestic": [],
+                    "error": str(e),
+                })
+
+        await browser.close()
+
+    # Write JSON
+    with open(args.out_json, "w", encoding="utf-8") as f:
+        json.dump(all_results, f, ensure_ascii=False, indent=2)
+
+    # Write CSV only for confirmed POM results within filter
+    fieldnames = [
+        "player_name", "player_url",
+        "match_url", "match_title",
+        "league_label", "match_datetime_utc",
+        "rating"
+    ]
+    rows = []
+    for bundle in all_results:
+        pname = bundle.get("player_name")
+        purl = bundle.get("player_url")
+        for r in bundle.get("pom_2025_26_domestic", []):
+            rows.append({
+                "player_name": pname,
+                "player_url": purl,
+                "match_url": r.get("match_url"),
+                "match_title": r.get("match_title"),
+                "league_label": r.get("league_label"),
+                "match_datetime_utc": r.get("match_datetime_utc"),
+                "rating": r.get("rating"),
+            })
+    with open(args.out_csv, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    # Print short summary to stdout
+    summary = {
+        "players_processed": len(all_results),
+        "total_pom_hits_2025_26_domestic": sum(b.get("pom_2025_26_domestic_count", 0) for b in all_results),
+        "json": os.path.abspath(args.out_json),
+        "csv": os.path.abspath(args.out_csv),
+    }
+    print(json.dumps(summary, indent=2))
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+
+Run Example
+# players.txt contains one URL per line
+python fotmob_batch_pom_2025_26.py --players-file players.txt --max-matches-per-player 100 --out-json out.json --out-csv out.csv
+# or inline:
+python fotmob_batch_pom_2025_26.py --urls https://www.fotmob.com/players/1467236/lamine-yamal https://www.fotmob.com/players/1021382/joao-pedro
+
+
+
+Node.js (Playwright)
+
+How to use
+1. Install
+npm i playwright
+npx playwright install chromium
+
+2. Run
+node fotmob_batch_pom_2025_26.mjs \
+  --players-file players.txt \
+  --max-matches-per-player 100 \
+  --out-json out.json \
+  --out-csv out.csv
+
+(Or use --urls to pass them inline.)
+
+
+Install
+npm i playwright
+npx playwright install chromium
+
+
+fotmob_batch_pom_2025_26.mjs
+
+import { chromium } from "playwright";
+import fs from "node:fs";
+import path from "node:path";
+
+const ALLOWED_LEAGUES = new Set([
+  "premier league",
+  "bundesliga",
+  "laliga",
+  "la liga",
+  "serie a",
+  "ligue 1",
+]);
+
+// Season window for 2025–2026 (UTC)
+const SEASON_START = new Date(Date.UTC(2025, 6, 1, 0, 0, 0)); // July=6
+const SEASON_END   = new Date(Date.UTC(2026, 5, 30, 23, 59, 59)); // June=5
+
+function norm(s = "") {
+  return s
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
+function leagueIsAllowed(label = "") {
+  const n = norm(label);
+  for (const allowed of ALLOWED_LEAGUES) {
+    if (n.includes(allowed)) return true;
+  }
+  return false;
+}
+
+async function maybeClickCookies(page) {
+  const labels = [/Accept.*/i, /Agree.*/i, /Allow all.*/i, /Got it.*/i, /I understand.*/i, /Continue.*/i];
+  for (const rx of labels) {
+    try {
+      const btn = page.getByRole("button", { name: rx });
+      if ((await btn.count()) > 0) {
+        await btn.first().click({ timeout: 1500 });
+        break;
+      }
+    } catch {}
+  }
+}
+
+async function extractPlayerName(page) {
+  try {
+    const h1 = page.getByRole("heading", { level: 1 });
+    if ((await h1.count()) > 0) {
+      const txt = (await h1.first().textContent())?.trim();
+      if (txt) return txt;
+    }
+  } catch {}
+  try {
+    const t = await page.title();
+    return t.split(" - ")[0].trim() || t.trim();
+  } catch {
+    return "";
+  }
+}
+
+async function collectMatchLinksWithScroll(page, maxLinks, maxScrolls = 10) {
+  const seen = new Set();
+  for (let i = 0; i < maxScrolls; i++) {
+    const links = await page
+      .locator('a[href*="/match/"]')
+      .evaluateAll((els) => els.map((e) => e.href));
+    for (const href of links) {
+      if (!seen.has(href)) {
+        seen.add(href);
+        if (seen.size >= maxLinks) return Array.from(seen).slice(0, maxLinks);
+      }
+    }
+    try {
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    } catch {}
+    await new Promise((r) => setTimeout(r, 800));
+  }
+  return Array.from(seen).slice(0, maxLinks);
+}
+
+async function parseMatchCompetition(page) {
+  // 1) League/tournament link text
+  try {
+    const texts = await page
+      .locator('a[href*="/league"], a[href*="/leagues"], a[href*="/tournament"], a[href*="/table"]')
+      .allTextContents();
+    for (const t of texts) {
+      if (leagueIsAllowed(t)) return t.trim();
+    }
+  } catch {}
+  // 2) Fallback scan
+  try {
+    const body = await page.evaluate(() => document.body.innerText || "");
+    for (const lbl of ALLOWED_LEAGUES) {
+      if (norm(body).includes(lbl)) return lbl;
+    }
+  } catch {}
+  return null;
+}
+
+function parseDateToUTC(s) {
+  // Let Date parse; if invalid, return null
+  const d = new Date(s);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+async function parseMatchDatetime(page) {
+  // Prefer <time datetime="...">
+  try {
+    const times = page.locator("time");
+    const cnt = await times.count();
+    for (let i = 0; i < cnt; i++) {
+      const dt = await times.nth(i).getAttribute("datetime");
+      if (dt) {
+        const parsed = parseDateToUTC(dt);
+        if (parsed) return parsed;
+      }
+    }
+  } catch {}
+  // Fallback: title/body scrape
+  const candidates = [];
+  try {
+    const t = await page.title();
+    if (t) candidates.push(t);
+  } catch {}
+  try {
+    const body = await page.evaluate(() => document.body.innerText || "");
+    if (body) candidates.push(body);
+  } catch {}
+
+  for (const txt of candidates) {
+    const parsed = parseDateToUTC(txt);
+    if (parsed) return parsed;
+  }
+  return null;
+}
+
+async function findPomBlockAndCheckPlayer(page, playerName) {
+  // returns { found, rating, isPom }
+  const patterns = [/player of the match/i, /man of the match/i];
+  let label = null;
+  for (const rx of patterns) {
+    try {
+      const loc = page.locator(`text=/${rx.source}/i`);
+      if ((await loc.count()) > 0) {
+        label = loc;
+        break;
+      }
+    } catch {}
+  }
+  if (!label) return { found: false, rating: null, isPom: false };
+
+  let containerText = "";
+  try {
+    containerText = await label.first().evaluate((el) => {
+      const host = el.closest("section,article,div") || el;
+      return host.innerText || "";
+    });
+  } catch {
+    try {
+      containerText = await page.evaluate(() => document.body.innerText || "");
+    } catch {
+      containerText = "";
+    }
+  }
+
+  const isPom = norm(containerText).includes(norm(playerName));
+  const m = containerText.match(/\b(\d{1,2}(?:\.\d)?)\b/);
+  const rating = m ? Number(m[1]) : null;
+
+  return { found: true, rating: Number.isNaN(rating) ? null : rating, isPom };
+}
+
+async function processMatch(context, matchUrl, playerName, politeDelay) {
+  const page = await context.newPage();
+  const out = {
+    match_url: matchUrl,
+    match_title: null,
+    league_label: null,
+    match_datetime_utc: null,
+    within_season_2025_26: false,
+    league_allowed: false,
+    player_of_the_match_block_found: false,
+    player_is_pom: false,
+    rating: null,
+    error: null,
+  };
+  try {
+    await page.goto(matchUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await maybeClickCookies(page);
+
+    out.match_title = await page.title();
+    const league = await parseMatchCompetition(page);
+    out.league_label = league;
+    out.league_allowed = Boolean(league && leagueIsAllowed(league));
+
+    const mdt = await parseMatchDatetime(page);
+    if (mdt) {
+      out.match_datetime_utc = mdt.toISOString();
+      out.within_season_2025_26 = mdt >= SEASON_START && mdt <= SEASON_END;
+    }
+
+    const { found, rating, isPom } = await findPomBlockAndCheckPlayer(page, playerName);
+    out.player_of_the_match_block_found = found;
+    out.player_is_pom = isPom;
+    out.rating = rating;
+
+    await new Promise((r) => setTimeout(r, politeDelay * 1000));
+  } catch (e) {
+    out.error = String(e);
+  } finally {
+    await page.close();
+  }
+  return out;
+}
+
+async function processPlayer(context, playerUrl, maxLinks, delay) {
+  const page = await context.newPage();
+  let playerName = "Unknown";
+  const results = [];
+  try {
+    await page.goto(playerUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await maybeClickCookies(page);
+    playerName = (await extractPlayerName(page)) || "Unknown";
+
+    const matchLinks = await collectMatchLinksWithScroll(page, maxLinks, 12);
+    for (const href of matchLinks) {
+      const info = await processMatch(context, href, playerName, delay);
+      results.push(info);
+    }
+  } finally {
+    await page.close();
+  }
+
+  const filtered = results.filter(
+    (r) => r.league_allowed && r.within_season_2025_26 && r.player_is_pom
+  );
+
+  return {
+    player_url: playerUrl,
+    player_name: playerName,
+    checked_matches: results.length,
+    pom_2025_26_domestic_count: filtered.length,
+    pom_2025_26_domestic: filtered,
+    raw: results,
+  };
+}
+
+function loadPlayerUrlsFromFile(filePath) {
+  const out = [];
+  const raw = fs.readFileSync(filePath, "utf-8");
+  for (const line of raw.split(/\r?\n/)) {
+    const s = line.trim();
+    if (s && !s.startsWith("#")) out.push(s);
+  }
+  return out;
+}
+
+function parseArgs(argv) {
+  const args = {
+    playersFile: null,
+    urls: [],
+    maxMatches: 80,
+    delay: 1.5,
+    outJson: "pom_results_2025_26.json",
+    outCsv: "pom_results_2025_26.csv",
+  };
+  for (let i = 2; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--players-file") args.playersFile = argv[++i];
+    else if (a === "--urls") {
+      // consume until next flag or end
+      while (argv[i + 1] && !argv[i + 1].startsWith("--")) {
+        args.urls.push(argv[++i]);
+      }
+    } else if (a === "--max-matches-per-player") args.maxMatches = Number(argv[++i]);
+    else if (a === "--delay") args.delay = Number(argv[++i]);
+    else if (a === "--out-json") args.outJson = argv[++i];
+    else if (a === "--out-csv") args.outCsv = argv[++i];
+  }
+  return args;
+}
+
+function writeCsv(outPath, bundles) {
+  const headers = [
+    "player_name",
+    "player_url",
+    "match_url",
+    "match_title",
+    "league_label",
+    "match_datetime_utc",
+    "rating",
+  ];
+  const lines = [headers.join(",")];
+  for (const b of bundles) {
+    const pname = (b.player_name || "").replace(/,/g, " ");
+    const purl = (b.player_url || "");
+    for (const r of b.pom_2025_26_domestic || []) {
+      const row = [
+        pname,
+        purl,
+        r.match_url || "",
+        (r.match_title || "").replace(/,/g, " "),
+        (r.league_label || "").replace(/,/g, " "),
+        r.match_datetime_utc || "",
+        r.rating == null ? "" : String(r.rating),
+      ];
+      lines.push(row.join(","));
+    }
+  }
+  fs.writeFileSync(outPath, lines.join("\n"), "utf-8");
+}
+
+async function main() {
+  const args = parseArgs(process.argv);
+
+  let playerUrls = [];
+  if (args.playersFile) playerUrls.push(...loadPlayerUrlsFromFile(args.playersFile));
+  if (args.urls.length) playerUrls.push(...args.urls);
+  playerUrls = Array.from(new Set(playerUrls));
+  if (!playerUrls.length) {
+    console.error("No player URLs provided. Use --players-file or --urls.");
+    process.exit(1);
+  }
+
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext();
+
+  const allResults = [];
+  for (const url of playerUrls) {
+    console.log("Processing:", url);
+    try {
+      const res = await processPlayer(context, url, args.maxMatches, args.delay);
+      allResults.push(res);
+    } catch (e) {
+      allResults.push({
+        player_url: url,
+        player_name: "Unknown",
+        checked_matches: 0,
+        pom_2025_26_domestic_count: 0,
+        pom_2025_26_domestic: [],
+        error: String(e),
+      });
+    }
+  }
+
+  await browser.close();
+
+  fs.writeFileSync(args.outJson, JSON.stringify(allResults, null, 2), "utf-8");
+  writeCsv(args.outCsv, allResults);
+
+  const summary = {
+    players_processed: allResults.length,
+    total_pom_hits_2025_26_domestic: allResults.reduce((a, b) => a + (b.pom_2025_26_domestic_count || 0), 0),
+    json: path.resolve(args.outJson),
+    csv: path.resolve(args.outCsv),
+  };
+  console.log(JSON.stringify(summary, null, 2));
+}
+
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});
+
+
+Run Example
+# players.txt => one FotMob player URL per line
+node fotmob_batch_pom_2025_26.mjs --players-file players.txt --max-matches-per-player 100 --out-json out.json --out-csv out.csv
+# or inline:
+node fotmob_batch_pom_2025_26.mjs --urls https://www.fotmob.com/players/1467236/lamine-yamal https://www.fotmob.com/players/1021382/joao-pedro
+
+
+
+
+
+What you’ll get
+
+out.json → array of players. Each object includes:
+
+player_name, player_url, checked_matches
+
+pom_2025_26_domestic_count → ✅ per-player total
+
+pom_2025_26_domestic → list of the qualifying matches (Top-5 league only, within 2025-07-01 → 2026-06-30).
+
+out.csv → only confirmed hits, one row per POM match:
+
+player_name,player_url,match_url,match_title,league_label,match_datetime_utc,rating
+
+
+Quick ways to see totals
+
+From JSON (with jq):
+jq -r '.[] | [.player_name, .pom_2025_26_domestic_count] | @csv' out.json
+
+From CSV (one row per hit):
+awk -F, 'NR>1 {c[$1]++} END {for (k in c) print k "," c[k]}' out.csv
+
+
+
+
+Python – add to fotmob_batch_pom_2025_26.py
+
+Append this block near the end of main(), after writing the CSV and before/after the existing summary print (either spot is fine):
+    # --- NEW: print per-player totals to stdout ---
+    print("\nPer-player POM totals (Top-5 domestic, 2025–26):")
+    for bundle in all_results:
+        pname = bundle.get("player_name", "Unknown")
+        pcount = bundle.get("pom_2025_26_domestic_count", 0)
+        print(f"- {pname}: {pcount}")
+
+(Full context—place this right after writer.writerows(rows) and before the existing summary = { ... }/print(json.dumps(summary, indent=2)).)
+
+
+Node.js – add to fotmob_batch_pom_2025_26.mjs
+
+Append this block near the end of main(), after you write JSON/CSV and before/after the existing summary log:
+
+
+  // --- NEW: print per-player totals to stdout ---
+  console.log("\nPer-player POM totals (Top-5 domestic, 2025–26):");
+  for (const b of allResults) {
+    const name = b.player_name || "Unknown";
+    const cnt = b.pom_2025_26_domestic_count || 0;
+    console.log(`- ${name}: ${cnt}`);
+  }
+
+(Full context—place this right after writeCsv(args.outCsv, allResults) and before the const summary = { ... } / console.log(JSON.stringify(summary, null, 2));.)
+
+What it looks like
+
+Per-player POM totals (Top-5 domestic, 2025–26):
+- Lamine Yamal: 3
+- João Pedro: 2
+- ... 
+{
+  "players_processed": 12,
+  "total_pom_hits_2025_26_domestic": 27,
+  "json": "/abs/path/out.json",
+  "csv": "/abs/path/out.csv"
+}
+
+
+
+
+
